@@ -18,6 +18,8 @@ endif()
 include_directories(${ZLIB_INCLUDE_DIRS})
 
 add_library(ctb SHARED
+  EsriCompactCacheV2Writer.cpp
+  CTBCompactTileSerializer.cpp
   GDALTile.cpp
   GDALTiler.cpp
   GDALDatasetReader.cpp
@@ -34,6 +36,8 @@ target_link_libraries(ctb ${GDAL_LIBRARIES} ${ZLIB_LIBRARIES})
 
 # Install libctb
 set(HEADERS
+  EsriCompactCacheV2Writer.hpp
+  CTBCompactTileSerializer.hpp
   Bounds.hpp
   BoundingSphere.hpp
   Coordinate.hpp

@@ -91,7 +91,9 @@
 
 #include "ctb/Bounds.hpp"
 #include "ctb/Coordinate.hpp"
+#include "ctb/CTBCompactTileSerializer.hpp"
 #include "ctb/CTBException.hpp"
+#include "ctb/EsriCompactCacheV2Writer.hpp"
 #include "ctb/GDALTile.hpp"
 #include "ctb/GDALTiler.hpp"
 #include "ctb/GlobalGeodetic.hpp"

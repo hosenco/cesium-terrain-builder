@@ -35,6 +35,17 @@ necessary. E.g.
 
     ctb-tile --output-dir ./terrain-tiles dem.tif
 
+Terrain and mesh payloads can instead be stored directly in Esri Compact Cache
+V2 bundles by selecting the `compact` storage backend:
+
+    ctb-tile --output-storage compact --output-dir ./terrain-compact dem.tif
+
+The compact output contains `layer.json` and
+`L<level>/R<row>C<column>.bundle` files. It uses the same TMS `z/x/y`
+coordinates as Cesium terrain URLs and the CMSS terrain reader; in particular,
+the bundle row is the CTB `y` value rather than a translated ArcGIS top-origin
+row. ArcGIS `conf.xml` and `conf.cdi` files are not generated.
+
 The input raster should contain data representing elevations relative to sea
 level. `NODATA` (null) values are not currently dealt with: these should be
 filled using interpolation in a data preprocessing step.
@@ -65,6 +76,7 @@ Options:
   -h, --help                          output help information
   -o --output-dir <dir>               specify the output directory for the tiles (defaults to working directory)
   -f --output-format <format>         specify the output format for the tiles. This is either `Terrain` (the default), `Mesh` (Chunked LOD mesh), or any format listed by `gdalinfo --formats`
+  -S --output-storage <storage>       specify the output storage backend. This is either `directory` (the default) or `compact`
   -p --profile <profile>              specify the TMS profile for the tiles. This is either `geodetic` (the default) or `mercator`
   -c --thread-count <count>           specify the number of threads to use for tile generation. On multicore machines this defaults to the number of CPUs
   -t --tile-size <size>               specify the size of the tiles in pixels. This defaults to 65 for terrain tiles and 256 for other GDAL formats
@@ -82,6 +94,12 @@ Options:
   -q --quiet                          flag outputs only errors
   -v --verbose                        flag outputs more noisy
 ```
+
+Compact storage is supported only for `Terrain` and `Mesh` output. A compact
+cache is append-only when replacing a tile: the bundle index points to the new
+payload and the old payload becomes unused slack. `--resume` skips coordinates
+already present in the index. Bundle writes are synchronized between CTB
+worker threads; independent CTB processes must not write the same bundle.
 
 #### Recommendations
 

@@ -53,6 +53,7 @@
 #include "MeshIterator.hpp"
 #include "GDALDatasetReader.hpp"
 #include "CTBFileTileSerializer.hpp"
+#include "CTBCompactTileSerializer.hpp"
 
 using namespace std;
 using namespace ctb;
@@ -70,6 +71,7 @@ public:
     Command(name, version),
     outputDir("."),
     outputFormat("Terrain"),
+    outputStorage("directory"),
     profile("geodetic"),
     threadCount(-1),
     tileSize(0),
@@ -107,6 +109,11 @@ public:
   static void
   setOutputFormat(command_t *command) {
     static_cast<TerrainBuild *>(Command::self(command))->outputFormat = command->arg;
+  }
+
+  static void
+  setOutputStorage(command_t *command) {
+    static_cast<TerrainBuild *>(Command::self(command))->outputStorage = command->arg;
   }
 
   static void
@@ -227,6 +234,7 @@ public:
 
   const char *outputDir,
     *outputFormat,
+    *outputStorage,
     *profile;
 
   int threadCount,
@@ -244,6 +252,14 @@ public:
   bool metadata;
   bool cesiumFriendly;
   bool vertexNormals;
+};
+
+struct TileSerializers {
+  GDALSerializer *gdal;
+  TerrainSerializer *terrain;
+  MeshSerializer *mesh;
+
+  TileSerializers() : gdal(NULL), terrain(NULL), mesh(NULL) {}
 };
 
 /**
@@ -707,7 +723,8 @@ buildMetadata(const RasterTiler &tiler, TerrainBuild *command, TerrainMetadata *
  * This function is designed to be run in a separate thread.
  */
 static int
-runTiler(const char *inputFilename, TerrainBuild *command, Grid *grid, TerrainMetadata *metadata) {
+runTiler(const char *inputFilename, TerrainBuild *command, Grid *grid,
+         TerrainMetadata *metadata, TileSerializers *serializers) {
   GDALDataset  *poDataset = (GDALDataset *) GDALOpen(inputFilename, GA_ReadOnly);
   if (poDataset == NULL) {
     cerr << "Error: could not open GDAL dataset" << endl;
@@ -717,30 +734,27 @@ runTiler(const char *inputFilename, TerrainBuild *command, Grid *grid, TerrainMe
   // Metadata of only this thread, it will be joined to global later
   TerrainMetadata *threadMetadata = metadata ? new TerrainMetadata() : NULL;
 
-  // Choose serializer of tiles (Directory of files, MBTiles store...)
-  CTBFileTileSerializer serializer(string(command->outputDir) + osDirSep, command->resume);
-
   try {
-    serializer.startSerialization();
-
     if (command->metadata) {
       const RasterTiler tiler(poDataset, *grid, command->tilerOptions);
       buildMetadata(tiler, command, threadMetadata);
     } else if (strcmp(command->outputFormat, "Terrain") == 0) {
       const TerrainTiler tiler(poDataset, *grid);
-      buildTerrain(serializer, tiler, command, threadMetadata);
+      buildTerrain(*serializers->terrain, tiler, command, threadMetadata);
     } else if (strcmp(command->outputFormat, "Mesh") == 0) {
       const MeshTiler tiler(poDataset, *grid, command->tilerOptions, command->meshQualityFactor);
-      buildMesh(serializer, tiler, command, threadMetadata, command->vertexNormals);
+      buildMesh(*serializers->mesh, tiler, command, threadMetadata, command->vertexNormals);
     } else {                    // it's a GDAL format
       const RasterTiler tiler(poDataset, *grid, command->tilerOptions);
-      buildGDAL(serializer, tiler, command, threadMetadata);
+      buildGDAL(*serializers->gdal, tiler, command, threadMetadata);
     }
 
   } catch (CTBException &e) {
     cerr << "Error: " << e.what() << endl;
+    GDALClose(poDataset);
+    delete threadMetadata;
+    return 1;
   }
-  serializer.endSerialization();
 
   GDALClose(poDataset);
 
@@ -762,6 +776,7 @@ main(int argc, char *argv[]) {
   command.setUsage("[options] GDAL_DATASOURCE");
   command.option("-o", "--output-dir <dir>", "specify the output directory for the tiles (defaults to working directory)", TerrainBuild::setOutputDir);
   command.option("-f", "--output-format <format>", "specify the output format for the tiles. This is either `Terrain` (the default), `Mesh` (Chunked LOD mesh), or any format listed by `gdalinfo --formats`", TerrainBuild::setOutputFormat);
+  command.option("-S", "--output-storage <storage>", "specify the output storage backend. This is either `directory` (the default) or `compact`", TerrainBuild::setOutputStorage);
   command.option("-p", "--profile <profile>", "specify the TMS profile for the tiles. This is either `geodetic` (the default) or `mercator`", TerrainBuild::setProfile);
   command.option("-c", "--thread-count <count>", "specify the number of threads to use for tile generation. On multicore machines this defaults to the number of CPUs", TerrainBuild::setThreadCount);
   command.option("-t", "--tile-size <size>", "specify the size of the tiles in pixels. This defaults to 65 for terrain tiles and 256 for other GDAL formats", TerrainBuild::setTileSize);
@@ -784,6 +799,18 @@ main(int argc, char *argv[]) {
   command.check();
 
   GDALAllRegister();
+
+  if (strcmp(command.outputStorage, "directory") != 0 &&
+      strcmp(command.outputStorage, "compact") != 0) {
+    cerr << "Error: Unknown output storage: " << command.outputStorage << endl;
+    return 1;
+  }
+  if (strcmp(command.outputStorage, "compact") == 0 &&
+      strcmp(command.outputFormat, "Terrain") != 0 &&
+      strcmp(command.outputFormat, "Mesh") != 0) {
+    cerr << "Error: Compact storage supports only Terrain and Mesh output formats" << endl;
+    return 1;
+  }
 
   // Set the output type
   if (command.verbosity > 1) {
@@ -822,13 +849,36 @@ main(int argc, char *argv[]) {
   // Calculate metadata?
   const string dirname = string(command.outputDir) + osDirSep;
   const std::string filename = concat(dirname, "layer.json");
-  TerrainMetadata *metadata = command.metadata ? new TerrainMetadata() : NULL;
+  const bool compactStorage = strcmp(command.outputStorage, "compact") == 0;
+  TerrainMetadata *metadata =
+    (command.metadata || compactStorage) ? new TerrainMetadata() : NULL;
+
+  TileSerializers serializers;
+  CTBFileTileSerializer *fileSerializer = NULL;
+  CTBCompactTileSerializer *compactSerializer = NULL;
+  if (compactStorage) {
+    compactSerializer =
+      new CTBCompactTileSerializer(command.outputDir, command.resume);
+    serializers.terrain = compactSerializer;
+    serializers.mesh = compactSerializer;
+  } else {
+    fileSerializer =
+      new CTBFileTileSerializer(string(command.outputDir) + osDirSep,
+                                command.resume);
+    serializers.gdal = fileSerializer;
+    serializers.terrain = fileSerializer;
+    serializers.mesh = fileSerializer;
+  }
+  if (serializers.gdal) serializers.gdal->startSerialization();
+  else serializers.terrain->startSerialization();
 
   // Instantiate the threads using futures from a packaged_task
   for (int i = 0; i < threadCount ; ++i) {
-    packaged_task<int(const char *, TerrainBuild *, Grid *, TerrainMetadata *)> task(runTiler); // wrap the function
+    packaged_task<int(const char *, TerrainBuild *, Grid *, TerrainMetadata *,
+                      TileSerializers *)> task(runTiler); // wrap the function
     tasks.push_back(task.get_future()); // get a future
-    thread(move(task), command.getInputFilename(), &command, &grid, metadata).detach(); // launch on a thread
+    thread(move(task), command.getInputFilename(), &command, &grid, metadata,
+           &serializers).detach(); // launch on a thread
   }
 
   // Synchronise the completion of the threads
@@ -842,11 +892,14 @@ main(int argc, char *argv[]) {
 
     // return on the first encountered problem
     if (retval) {
+      if (serializers.gdal) serializers.gdal->endSerialization();
+      else serializers.terrain->endSerialization();
       delete metadata;
+      delete fileSerializer;
+      delete compactSerializer;
       return retval;
     }
   }
-
   // CesiumJS friendly?
   if (command.cesiumFriendly && (strcmp(command.profile, "geodetic") == 0) && command.endZoom <= 0) {
 
@@ -861,14 +914,26 @@ main(int argc, char *argv[]) {
       ctb::TileCoordinate missingTileCoord(missingZoom, 0, 0);
       std::string missingTileName;
 
-      if (fileExists(tileName0) && !fileExists(tileName1)) {
-        VSIMkdir(dirName1.c_str(), 0755);
+      bool tile0Exists = false;
+      bool tile1Exists = false;
+      if (compactStorage) {
+        ctb::TileCoordinate coord0(0, 0, 0);
+        ctb::TileCoordinate coord1(0, 1, 0);
+        tile0Exists = compactSerializer->hasTile(&coord0);
+        tile1Exists = compactSerializer->hasTile(&coord1);
+      } else {
+        tile0Exists = fileExists(tileName0);
+        tile1Exists = fileExists(tileName1);
+      }
+
+      if (tile0Exists && !tile1Exists) {
+        if (!compactStorage) VSIMkdir(dirName1.c_str(), 0755);
         missingTileCoord = ctb::TileCoordinate(0, 1, 0);
         missingTileName = tileName1;
       }
       else
-      if (!fileExists(tileName0) && fileExists(tileName1)) {
-        VSIMkdir(dirName0.c_str(), 0755);
+      if (!tile0Exists && tile1Exists) {
+        if (!compactStorage) VSIMkdir(dirName0.c_str(), 0755);
         missingTileCoord = ctb::TileCoordinate(0, 0, 0);
         missingTileName = tileName0;
       }
@@ -876,9 +941,22 @@ main(int argc, char *argv[]) {
         globalIteratorIndex = 0; // reset global iterator index
         command.startZoom = 0;
         command.endZoom = 0;
+        if (compactStorage) {
+          missingTileName = string(command.outputDir) + osDirSep +
+            "ctb-empty-root-" + to_string(missingTileCoord.x);
+        }
         missingTileName = createEmptyRootElevationFile(missingTileName, grid, missingTileCoord);
-        runTiler (missingTileName.c_str(), &command, &grid, NULL);
+        const int rootResult =
+          runTiler(missingTileName.c_str(), &command, &grid, NULL, &serializers);
         VSIUnlink(missingTileName.c_str());
+        if (rootResult) {
+          if (serializers.gdal) serializers.gdal->endSerialization();
+          else serializers.terrain->endSerialization();
+          delete metadata;
+          delete fileSerializer;
+          delete compactSerializer;
+          return rootResult;
+        }
       }
     }
 
@@ -892,6 +970,9 @@ main(int argc, char *argv[]) {
     }
   }
 
+  if (serializers.gdal) serializers.gdal->endSerialization();
+  else serializers.terrain->endSerialization();
+
   // Write Json metadata file?
   if (metadata) {
     std::string datasetName(command.getInputFilename());
@@ -903,5 +984,7 @@ main(int argc, char *argv[]) {
     delete metadata;
   }
 
+  delete fileSerializer;
+  delete compactSerializer;
   return 0;
 }

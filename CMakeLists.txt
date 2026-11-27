@@ -78,3 +78,6 @@ add_subdirectory(deps)
 
 # Build and install the tools
 add_subdirectory(tools)
+
+enable_testing()
+add_subdirectory(tests)
